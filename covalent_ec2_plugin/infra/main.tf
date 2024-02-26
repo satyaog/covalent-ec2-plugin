@@ -37,7 +37,7 @@ data "aws_ami" "ubuntu" {
 
 resource "aws_instance" "covalent_ec2_instance" {
 
-  ami           = data.aws_ami.ubuntu.id
+  ami           = var.aws_ami == "" ? data.aws_ami.ubuntu.id : var.aws_ami
   instance_type = var.instance_type
 
   vpc_security_group_ids      = [aws_security_group.covalent_firewall.id]
@@ -65,14 +65,17 @@ resource "null_resource" "deps_install" {
   }
   provisioner "remote-exec" {
     inline = [
+      "set -o errexit",
       "echo 'Installing Conda...'",
-      "wget https://repo.anaconda.com/miniconda/Miniconda3-py38_4.12.0-Linux-x86_64.sh",
+      "wget https://repo.anaconda.com/miniconda/Miniconda3-py38_4.12.0-Linux-x86_64.sh -O Miniconda3-py38_4.12.0-Linux-x86_64.sh",
       "chmod +x Miniconda3-py38_4.12.0-Linux-x86_64.sh",
-      "./Miniconda3-py38_4.12.0-Linux-x86_64.sh -b -p ~/miniconda3",
+      "! ./Miniconda3-py38_4.12.0-Linux-x86_64.sh -b -p ~/miniconda3",
       "echo 'Creating Conda Environment...'",
       "eval \"$(~/miniconda3/bin/conda shell.bash hook)\"",
+      "echo 'eval \"$(~/miniconda3/bin/conda shell.bash hook)\"' > $HOME/.condaenvrc",
       "conda init bash",
-      "conda create -n covalent python=3.8.13 -y",
+      "conda activate covalent || conda create -n covalent -y && conda activate covalent",
+      "conda install python=${var.python3_version} virtualenv pip -y",
       "echo \"conda activate covalent\" >> $HOME/.bashrc",
       "conda activate covalent",
       "echo 'Installing Covalent...'",

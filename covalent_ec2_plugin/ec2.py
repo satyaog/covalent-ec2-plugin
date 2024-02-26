@@ -21,6 +21,8 @@ import copy
 import os
 import subprocess
 from pathlib import Path
+import sys
+import time
 from typing import Dict, List
 
 import boto3
@@ -39,6 +41,7 @@ _EXECUTOR_PLUGIN_DEFAULTS = copy.deepcopy(_SSH_EXECUTOR_PLUGIN_DEFAULTS)
 _EXECUTOR_PLUGIN_DEFAULTS.update(
     {
         "profile": "",
+        "ami": "ami-0f5daaa3a7fb3378b",
         "credentials_file": "",
         "region": "",
         "instance_type": "t2.micro",
@@ -47,6 +50,9 @@ _EXECUTOR_PLUGIN_DEFAULTS.update(
         "subnet": "",
         "key_name": "",
         "conda_env": "covalent",
+        "state_prefix": "",
+        "state_id": "",
+        "action": "",
     }
 )
 
@@ -82,6 +88,7 @@ class EC2Executor(SSHExecutor, AWSExecutor):
     def __init__(
         self,
         profile: str = None,
+        ami: str = None,
         key_name: str = None,
         username: str = None,
         hostname: str = None,
@@ -92,6 +99,9 @@ class EC2Executor(SSHExecutor, AWSExecutor):
         vpc: str = "",
         subnet: str = "",
         conda_env: str = "covalent",
+        state_prefix: str = "",
+        state_id: str = "",
+        action: str = "",
         ssh_key_file: str = None,
         cache_dir: str = None,
         python_path: str = "",
@@ -100,6 +110,8 @@ class EC2Executor(SSHExecutor, AWSExecutor):
         poll_freq: int = 15,
         do_cleanup: bool = True,
         covalent_version_to_install: str = "",  # Current stable version
+        remote_workdir: str = "",
+        create_unique_workdir: str = "",
     ) -> None:
 
         username = username or get_config("executors.ec2.username")
@@ -123,10 +135,13 @@ class EC2Executor(SSHExecutor, AWSExecutor):
             run_local_on_ssh_fail=run_local_on_ssh_fail,
             poll_freq=poll_freq,
             do_cleanup=do_cleanup,
+            remote_workdir=remote_workdir,
+            create_unique_workdir=create_unique_workdir,
         )
 
         # as executor instance is reconstructed the below values are seemingly lost, added back here as a temp fix
         self.profile = profile or get_config("executors.ec2.profile")
+        self.ami = ami or get_config("executors.ec2.ami")
         self.region = region or get_config("executors.ec2.region")
         self.credentials_file = credentials_file or get_config("executors.ec2.credentials_file")
 
@@ -140,9 +155,14 @@ class EC2Executor(SSHExecutor, AWSExecutor):
         self.vpc = vpc or get_config("executors.ec2.vpc")
         self.subnet = subnet or get_config("executors.ec2.subnet")
 
+        self.python3_version = f"{sys.version_info.major}.{sys.version_info.minor}"
         # TODO: Remove this once AWSExecutor has a `covalent_version` attribute
         # Setting covalent version to be used in the EC2 instance
         self.covalent_version = covalent_version_to_install
+        self.infra_vars = []
+        self.state_prefix = state_prefix or get_config("executors.ec2.state_prefix")
+        self.state_id = state_id or get_config("executors.ec2.state_id")
+        self.action = action or get_config("executors.ec2.action")
 
     async def _run_async_subprocess(self, cmd: List[str], cwd=None, log_output: bool = False):
 
@@ -175,9 +195,26 @@ class EC2Executor(SSHExecutor, AWSExecutor):
 
         return proc, stdout, stderr
 
+    async def _run_or_retry(self, *args, timeout=10*60, **kwargs):
+        t =- time.time()
+        while True:
+            if t + time.time() >= timeout:
+                raise TimeoutError(f"Could not initialize instance within {timeout} secs")
+
+            try:
+                await self._run_async_subprocess(*args, **kwargs)
+                break
+            except subprocess.CalledProcessError:
+                await asyncio.sleep(1)
+
+    def _get_state_id(self, task_metadata: Dict) -> str:
+        prefix = self.state_prefix or task_metadata["node_id"]
+        id = self.state_id or task_metadata["dispatch_id"]
+        return f"{'-'.join([prefix, id])}"
+
     def _get_tf_statefile_path(self, task_metadata: Dict) -> str:
         state_file = (
-            f"{self._TF_DIR}/ec2-{task_metadata['dispatch_id']}-{task_metadata['node_id']}.tfstate"
+            f"{self._TF_DIR}/ec2-{self._get_state_id(task_metadata)}.tfstate"
         )
         return state_file
 
@@ -187,12 +224,27 @@ class EC2Executor(SSHExecutor, AWSExecutor):
         )
         return value
 
+    def _get_infra_vars(self, task_metadata, boto_session=None):
+        boto_session = boto_session if boto_session else boto3.Session(**self.boto_session_options())
+        profile = boto_session.profile_name
+        region = boto_session.region_name
+        return [
+            f"-var=aws_region={region}",
+            f"-var=aws_ami={self.ami}",
+            f"-var=aws_profile={profile}",
+            f"-var=name=covalent-ec2-task-{self._get_state_id(task_metadata)}",
+            f"-var=instance_type={self.instance_type}",
+            f"-var=disk_size={self.volume_size}",
+            f"-var=key_file={self.ssh_key_file}",
+            f"-var=key_name={self.key_name}",
+            f"-var=python3_version={self.python3_version}",
+            f"-var=covalent_version={self.covalent_version}",
+        ]
+    
     async def setup(self, task_metadata: Dict) -> None:
         """
         Invokes Terraform to provision supporting resources for the instance
-
         """
-
         # Init Terraform (doing this in a blocking manner to avoid race conditions during init, better way would to be use asyncio
         # locks or to ensure that terraform init is run just once)
         subprocess.run(["terraform init"], cwd=self._TF_DIR, shell=True, check=True)
@@ -200,8 +252,6 @@ class EC2Executor(SSHExecutor, AWSExecutor):
         state_file = self._get_tf_statefile_path(task_metadata)
 
         boto_session = boto3.Session(**self.boto_session_options())
-        profile = boto_session.profile_name
-        region = boto_session.region_name
 
         ec2 = boto_session.client("ec2")
         self.key_name = EC2_KEYPAIR_NAME
@@ -239,18 +289,10 @@ class EC2Executor(SSHExecutor, AWSExecutor):
             "apply",
             "-auto-approve",
             f"-state={state_file}",
+            "-lock-timeout=60s",
         ]
 
-        self.infra_vars = [
-            f"-var=aws_region={region}",
-            f"-var=aws_profile={profile}",
-            f"-var=name=covalent-ec2-task-{task_metadata['dispatch_id']}-{task_metadata['node_id']}",
-            f"-var=instance_type={self.instance_type}",
-            f"-var=disk_size={self.volume_size}",
-            f"-var=key_file={self.ssh_key_file}",
-            f"-var=key_name={self.key_name}",
-            f"-var=covalent_version={self.covalent_version}",
-        ]
+        self.infra_vars = self._get_infra_vars(task_metadata, boto_session)
 
         if self.credentials_file:
             self.infra_vars += [f"-var=aws_credentials={self.credentials_file}"]
@@ -264,7 +306,8 @@ class EC2Executor(SSHExecutor, AWSExecutor):
 
         app_log.debug(f"Running Terraform setup command: {cmd}")
 
-        await self._run_async_subprocess(cmd, cwd=self._TF_DIR, log_output=True)
+        if self.action != "teardown":
+            await self._run_or_retry(cmd, cwd=self._TF_DIR, log_output=True)
 
         # Get Hostname from Terraform Output
         self.hostname = await self._get_tf_output("hostname", state_file)
@@ -279,6 +322,8 @@ class EC2Executor(SSHExecutor, AWSExecutor):
         """
         Invokes Terraform to terminate the instance and teardown supporting resources
         """
+        if self.action == "setup":
+            return
 
         state_file = self._get_tf_statefile_path(task_metadata)
 
@@ -287,12 +332,12 @@ class EC2Executor(SSHExecutor, AWSExecutor):
                 f"Could not find Terraform state file: {state_file}. Infrastructure may need to be manually deprovisioned."
             )
 
-        base_cmd = ["terraform", "destroy", "-auto-approve", f"-state={state_file}"]
-        cmd = base_cmd + self.infra_vars
+        base_cmd = ["terraform", "destroy", "-auto-approve", f"-state={state_file}", "-lock-timeout=60s"]
+        cmd = base_cmd + (self.infra_vars if self.infra_vars else self._get_infra_vars(task_metadata))
 
         app_log.debug(f"Running teardown Terraform command: {cmd}")
 
-        await self._run_async_subprocess(cmd, cwd=self._TF_DIR, log_output=True)
+        await self._run_or_retry(cmd, cwd=self._TF_DIR, log_output=True)
 
         # Delete the state file
         os.remove(state_file)

@@ -20,6 +20,7 @@ from pathlib import Path
 from unittest import mock
 
 import covalent as ct
+from covalent._shared_files.util_classes import RESULT_STATUS
 import pytest
 
 from covalent_ec2_plugin import ec2
@@ -114,8 +115,17 @@ async def test_setup(executor: ec2.EC2Executor, mocker: mock, tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_teardown(executor: ec2.EC2Executor, mocker: mock, tmp_path: Path):
-    mock_task_metadata = {"dispatch_id": "123", "node_id": 1}
+@pytest.mark.parametrize(
+    ("node_id", "status"),
+    [
+        (nid, status)
+        for nid in range(0, 5)
+        for status in RESULT_STATUS.__dict__
+        if status.isupper()
+    ]
+)
+async def test_teardown(executor: ec2.EC2Executor, mocker: mock, tmp_path: Path, node_id, status):
+    mock_task_metadata = {"dispatch_id": "123", "node_id": node_id}
 
     state_file = tmp_path / "state.tfstate"
     not_existing_state_file = str(tmp_path / "dne.tfstate")
@@ -124,6 +134,27 @@ async def test_teardown(executor: ec2.EC2Executor, mocker: mock, tmp_path: Path)
     state_file = str(state_file)
 
     executor.infra_vars = ["-var='mock_var=123'"]
+
+    mocker.patch(
+        "covalent.get_result",
+        return_value={"status":status},
+    )
+
+    if not (
+        node_id == 0 or status in (
+            RESULT_STATUS.CANCELLED,
+            RESULT_STATUS.COMPLETED,
+            RESULT_STATUS.FAILED,
+        )
+    ):
+        get_tf_statefile_path = mock.AsyncMock()
+        mocker.patch(
+            "covalent_ec2_plugin.ec2.EC2Executor._get_tf_statefile_path",
+            side_effect=get_tf_statefile_path,
+        )
+        await executor.teardown(mock_task_metadata)
+        get_tf_statefile_path.assert_not_called()
+        return
 
     run_async_process_mock = mock.AsyncMock()
     mocker.patch(

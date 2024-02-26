@@ -19,6 +19,11 @@ variable "name" {
   description = "Name used to prefix AWS resources"
 }
 
+variable "aws_ami" {
+  default     = "ami-0f5daaa3a7fb3378b"
+  description = "AMI id to use"
+}
+
 variable "aws_region" {
   default     = "us-east-1"
   description = "Region where resources for the EC2 plugin are deployed"
@@ -77,6 +82,11 @@ variable "disk_size" {
 variable "key_file" {
   default     = ""
   description = "Private key used for SSH provisioner"
+}
+
+variable "python3_version" {
+  default     = "3.8.13"
+  description = "Covalent version to install on the EC2 instance"
 }
 
 variable "covalent_version" {
