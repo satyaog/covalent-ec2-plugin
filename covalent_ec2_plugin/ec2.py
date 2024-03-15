@@ -306,8 +306,8 @@ class EC2Executor(SSHExecutor, AWSExecutor):
 
         app_log.debug(f"Running Terraform setup command: {cmd}")
 
-        if self.action != "teardown":
-            await self._run_or_retry(cmd, cwd=self._TF_DIR, log_output=True)
+        # if self.action != "teardown":
+        #     await self._run_or_retry(cmd, cwd=self._TF_DIR, log_output=True)
 
         # Get Hostname from Terraform Output
         self.hostname = await self._get_tf_output("hostname", state_file)
@@ -337,8 +337,8 @@ class EC2Executor(SSHExecutor, AWSExecutor):
 
         app_log.debug(f"Running teardown Terraform command: {cmd}")
 
-        await self._run_or_retry(cmd, cwd=self._TF_DIR, log_output=True)
+        # await self._run_or_retry(cmd, cwd=self._TF_DIR, log_output=True)
 
-        # Delete the state file
-        os.remove(state_file)
-        os.remove(f"{state_file}.backup")
+        # # Delete the state file
+        # os.remove(state_file)
+        # os.remove(f"{state_file}.backup")
